@@ -1,0 +1,73 @@
+name: vitest-unit-canon
+
+# Reusable workflow to run vitest unit tests on the in-cluster ARC runner.
+# Generic: takes a filter and runs `pnpm --filter <X> test`. No Docker.
+#
+# Usage:
+#   jobs:
+#     test:
+#       uses: technologykameleonlabs/kameleon-fleet-actions/.github/workflows/vitest-unit-canon.yml@main
+#       with:
+#         filter: '@kameleon/api'
+#         prisma_generate: true
+
+on:
+  workflow_call:
+    inputs:
+      filter:
+        description: "pnpm --filter target (e.g. '@kameleon/api')."
+        required: true
+        type: string
+      prisma_generate:
+        description: "If true, runs `pnpm --filter @kameleon/db db:generate` before tests."
+        required: false
+        type: boolean
+        default: false
+      node_version:
+        description: "Node.js version."
+        required: false
+        type: string
+        default: "20"
+      env_vars:
+        description: "Multiline env vars (KEY=value) for the test step."
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  test:
+    name: vitest (unit)
+    runs-on: arc-runner
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        if: inputs.prisma_generate
+        run: pnpm --filter @kameleon/db db:generate
+
+      - name: Run vitest
+        env:
+          NODE_ENV: test
+        run: |
+          set -euo pipefail
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            export "$line"
+          done <<<"${{ inputs.env_vars }}"
+          pnpm --filter "${{ inputs.filter }}" test

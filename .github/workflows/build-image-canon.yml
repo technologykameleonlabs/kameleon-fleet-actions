@@ -1,0 +1,145 @@
+name: build-image-canon
+
+# Reusable workflow used by every KameleonLabs product to build (and
+# optionally push) a Docker image. Runs on the in-cluster ARC self-hosted
+# runner; the build itself is offloaded to the rootless buildkitd
+# Deployment in namespace `buildkit-system`.
+#
+# Usage from a product repo:
+#
+#   jobs:
+#     build:
+#       uses: technologykameleonlabs/kameleon-fleet-actions/.github/workflows/build-image-canon.yml@main
+#       with:
+#         image_name: ghcr.io/technologykameleonlabs/<product>-app
+#         dockerfile: Dockerfile.unified
+#         context: .
+#         tag_prefix: dev
+#         build_args: |
+#           NEXT_PUBLIC_APP_URL=https://<product>.kameleonlabs.ai
+#       secrets: inherit
+#
+# What it does:
+#   - PR events: build only (compile gate, no push).
+#   - push events: build + push to ghcr.io tagging <prefix>-<short_sha>
+#     and <prefix>-latest.
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: "Full image name without tag (e.g. ghcr.io/org/repo)."
+        required: true
+        type: string
+      dockerfile:
+        description: "Path to the Dockerfile."
+        required: false
+        type: string
+        default: Dockerfile
+      context:
+        description: "Docker build context."
+        required: false
+        type: string
+        default: .
+      tag_prefix:
+        description: "Tag prefix (e.g. dev, prod). Image is tagged <prefix>-<short_sha> and <prefix>-latest."
+        required: false
+        type: string
+        default: dev
+      build_args:
+        description: "Multiline build-args. Passed verbatim to docker/build-push-action."
+        required: false
+        type: string
+        default: ""
+      buildkitd_endpoint:
+        description: "Override the in-cluster buildkitd Service endpoint."
+        required: false
+        type: string
+        default: "tcp://buildkitd.buildkit-system.svc.cluster.local:1234"
+    outputs:
+      short_sha:
+        description: "Short SHA (7 chars) of the built commit."
+        value: ${{ jobs.build-and-push.outputs.short_sha }}
+      tag_full:
+        description: "Full <prefix>-<short_sha> tag produced."
+        value: ${{ jobs.build-and-push.outputs.tag_full }}
+
+jobs:
+  build-and-push:
+    name: Build & push image (canon)
+    runs-on: arc-runner
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+      tag_full: ${{ steps.meta.outputs.tag_full }}
+    steps:
+      - name: Install Docker buildx CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v docker >/dev/null 2>&1 && docker buildx version >/dev/null 2>&1; then
+            echo "buildx already present"
+            exit 0
+          fi
+          mkdir -p "$HOME/.docker/cli-plugins"
+          curl -fsSLo "$HOME/.docker/cli-plugins/docker-buildx" \
+            "https://github.com/docker/buildx/releases/download/v0.18.0/buildx-v0.18.0.linux-amd64"
+          chmod +x "$HOME/.docker/cli-plugins/docker-buildx"
+          docker buildx version
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve build metadata
+        id: meta
+        run: |
+          short_sha=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "tag_full=${{ inputs.tag_prefix }}-${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "tag_latest=${{ inputs.tag_prefix }}-latest" >> "$GITHUB_OUTPUT"
+          echo "build_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx (in-cluster buildkitd)
+        run: |
+          set -euo pipefail
+          docker buildx create \
+            --name kameleon-canon \
+            --driver remote \
+            "${{ inputs.buildkitd_endpoint }}" \
+            --use
+          docker buildx inspect --bootstrap kameleon-canon
+
+      - name: Build (PRs) or Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ${{ inputs.image_name }}:${{ steps.meta.outputs.tag_full }}
+            ${{ inputs.image_name }}:${{ steps.meta.outputs.tag_latest }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            GIT_BRANCH=${{ github.ref_name }}
+            BUILD_AT=${{ steps.meta.outputs.build_at }}
+            ${{ inputs.build_args }}
+
+      - name: Image summary
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "::notice title=Image published::${{ inputs.image_name }}:${{ steps.meta.outputs.tag_full }} and :${{ steps.meta.outputs.tag_latest }}"
+
+      - name: PR build summary
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "::notice title=PR compile gate passed::Docker build of ${{ inputs.dockerfile }} succeeded for PR #${{ github.event.pull_request.number }}. Image NOT pushed (PRs don't publish)."
