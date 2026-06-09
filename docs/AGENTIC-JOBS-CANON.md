@@ -278,6 +278,82 @@ git clone --depth 50 --branch dev URL repo
 cd repo
 ```
 
+### Bug #8 — `${{ github.event.comment.body }}` inline rompe bash con backticks
+
+**Síntoma**: workflow falla con exit 127 ("command not found") en step que usa `BODY="${{ github.event.comment.body }}"`. Loop infinito si watchdog dispara el mismo workflow tras el fail.
+
+**Causa**: GHA expande `${{ }}` inline en el script bash ANTES de que bash parse. Si el body contiene backticks (común en comments con código, IDs de Jobs, etc.), bash los evalúa como command substitution.
+
+**Fix canon**: leer el body via `gh api` con `comment.id`. El body es DATA, no código:
+```bash
+COMMENT_ID="${{ github.event.comment.id }}"
+BODY=$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID" --jq '.body // ""')
+```
+
+Aplicado en `auto-assignment.yml` (commit 57b8d561) y `agents-rollback.yml` (commit 759c73c7).
+
+### Bug #9 — CHANGE_ID con `[` `]` no válido en labels k8s
+
+**Síntoma**: `agentic-codex-${JOB_NAME_SUFFIX}` Job creation falla con `spec.template.labels: Invalid value` y `must be no more than 63 characters`.
+
+**Causa**: CHANGE_ID tipo `[APP-KAF-31]-remove-discovery-tab` tiene caracteres no válidos en labels k8s (`[`, `]`) + nombre supera 63 chars.
+
+**Fix canon**: sanitize CHANGE_ID a slug minúsculas-numeros-guion + truncar nombre Job:
+```bash
+CHANGE_SLUG=$(echo "${CHANGE_ID}" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '-' | sed 's/--*/-/g; s/^-*//; s/-*$//' | cut -c1-25)
+JOB_NAME_SUFFIX="verify-${CHANGE_SLUG}-r${GITHUB_RUN_ID}"
+```
+
+Aplicado en `change-completed.yml` (commit cb281071).
+
+### Bug #10 — GitHub Actions schedule sub-5-min no dispara
+
+**Síntoma**: workflow con `on: schedule: '* * * * *'` o `'*/2 * * * *'` aceptado pero NO dispara via event=schedule. Todos los runs son workflow_dispatch manual.
+
+**Causa**: GitHub Actions no garantiza schedules sub-5-min en la práctica. Repos con muchos workflows o organizaciones bajo carga pueden skip ticks por debajo de ese floor.
+
+**Fix canon**: schedule mínimo `*/5 * * * *`. Para autonomy más agresiva, complementar con `workflow_run` triggers reactivos a otros workflows.
+
+### Bug #11 — k8s CronJob necesita PAT con `actions:write` para dispatch
+
+**Síntoma**: CronJob k8s con curl al endpoint `/dispatches` devuelve `403 "Resource not accessible by personal access token"`.
+
+**Causa**: Bot PAT canon tiene `Contents+Pull-requests+Issues R+W` pero NO `Actions R+W`.
+
+**Fix canon**: reemplazar el k8s CronJob con un **workflow GHA con `on: schedule`** que usa `GITHUB_TOKEN` automático del runner (que SÍ tiene actions:write). Elimina la dependencia del PAT custom. Aplicado en `agentic-cron-dispatcher.yml` (commit 00bc8ea3).
+
+### Bug #12 — Auto-merge canon ciego al build TS post-merge
+
+**Síntoma**: adversarial review PASS → auto-merge OK → build sandbox image post-merge fail por TS error → imagen `dev-latest` no actualizada → código no llega a producción silenciosamente. Detectado visualmente por usuario.
+
+**Causa**: el step auto-merge canon solo checkeaba `gate_status==success` del reviewer, no verificaba el build.
+
+**Fix canon**: pre-check del check-run `Build & push image` en el HEAD SHA antes de mergear. Espera hasta 8 min (poll 30s). Si conclusion≠success → NO mergea + comment al PR. Aplicado en `adversarial-review-jobs.yml` (commit d4a0c825).
+
+### Bug #13 — Broker auth.json mtime stale silencioso
+
+**Síntoma**: tras ~2h idle, broker health endpoint devuelve 503 `auth_file_stale`. Todos los Jobs efímeros fallan en fetch-auth init container. Loop de fails silencioso.
+
+**Causa**: `codex exec` keepalive reporta OK pero NO toca `/state/auth.json` en disco si la sesión Codex sigue válida server-side. mtime nunca se actualiza.
+
+**Fix canon doble**: 
+1. **Touch /state/auth.json tras `codex exec` OK** en el keepalive (commit 8b18ce5).
+2. **Healthcheck broker + auto-restart en cada tick del cron-dispatcher**: si unhealthy, touch desde keepalive; si sigue mal, rollout restart (commit f3fac018).
+
+### Bug #14 — Watchdog no escuchaba build-sandbox-image
+
+**Síntoma**: Bug #12 (build fail post-merge silencioso) no disparaba el watchdog canon.
+
+**Causa**: watchdog escuchaba solo workflows del pipeline agentic (worker/reviewer/orchestrator/etc), NO los 3 workflows canon de infra: `build-sandbox-image`, `build-orchestrator-image`, `agentic-cron-dispatcher`.
+
+**Fix canon**: añadidos a la lista del watchdog en commit 1c5bd65c.
+
+### Bug #15 — Orchestrator fail huérfano deja Historia "In Progress" sin Change SDD
+
+**Síntoma**: Historia transitiona a "In Progress" cuando orchestrator-dispatch workflow ejecuta `/start`, PERO el Job k8s del orchestrator falla en mitad. Workflow GHA termina succeeded (su trabajo era crear el Job, no esperarlo) → watchdog basado en workflow_run NO se dispara → Historia huérfana, dispatcher la ve "no ready" y nunca la reintenta.
+
+**Fix canon**: step **Recover stale orphan Historias** en cada tick del cron-dispatcher (commit 65c0a0cc). Busca Historias en (To Do, In Progress, In Review) con `updatedAt > 15 min` y las resetea a Backlog. Self-healing canon.
+
 ## Onboarding de un producto nuevo (playbook canónico)
 
 Para que un producto nuevo del portfolio (PadelPeak, EvaleIA, Squadwise, etc.) use el patrón Jobs canon. Asume `<producto>-lab` como namespace.
