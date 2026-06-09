@@ -380,3 +380,42 @@ sed 's/kameleonapp-lab/<producto>-lab/g; s/KAF_/<PROD>_/g; s/kameleon-fleet-boot
 - `feedback_oauth_broker_for_ephemeral_jobs` — diseño high-level.
 - `project_self_hosted_ci_canon` — ARC + buildkitd in-cluster (base sobre la que corren los workflows GHA).
 - `feedback_agentic_flow_never_silent` — watchdog canon que monitoriza estos workflows.
+
+## Identidad bot en workflows GHA (patrón canon)
+
+Cuando un workflow GHA del piloto agentic necesita permisos GitHub que
+`secrets.GITHUB_TOKEN` no proporciona (`mergePullRequest`, branches
+protegidas, admin actions), el patrón canon es **extraer el bot PAT
+del cluster Secret** runtime:
+
+```yaml
+- name: Mint bot token desde cluster Secret canon
+  id: bot-token
+  shell: bash
+  run: |
+    set -euo pipefail
+    TOKEN=$(kubectl get secret <producto>-lab-orchestrator-github \
+      -n <producto>-lab \
+      -o jsonpath='{.data.GITHUB_TOKEN}' | base64 -d)
+    echo "::add-mask::$TOKEN"
+    echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+- name: <step que necesita el PAT>
+  env:
+    GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+  run: gh pr merge ...  # o cualquier comando gh
+```
+
+**Por qué este patrón es canon (no deuda)**:
+
+1. Bot identity vive en cluster Secret = single source of truth canon
+   (sincronizado desde HC Vault vía ExternalSecrets).
+2. Workflows GHA self-hosted en arc-runners tienen acceso al cluster por
+   defecto.
+3. Alternativa GitHub App proper introduce más componentes (App key
+   secret, instalaciones por repo, rotación canon) sin ganancia
+   funcional real.
+4. Portable a cualquier producto del portfolio cambiando solo el nombre
+   del Secret.
+
+Ver memoria canon `feedback_jobs_canon_token_extraction_coherent`.
