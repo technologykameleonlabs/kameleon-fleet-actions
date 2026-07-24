@@ -67,7 +67,7 @@ on:
 jobs:
   build-and-push:
     name: Build & push image (canon)
-    runs-on: arc-runner
+    runs-on: arc-runner-small
     permissions:
       contents: read
       packages: write
