@@ -3,7 +3,8 @@ name: build-image-canon
 # Reusable workflow used by every KameleonLabs product to build (and
 # optionally push) a Docker image. Runs on the in-cluster ARC self-hosted
 # runner; the build itself is offloaded to the rootless buildkitd
-# Deployment in namespace `buildkit-system`.
+# StatefulSet in namespace `buildkit-system` (2 replicas behind a
+# round-robin Service).
 #
 # Usage from a product repo:
 #
@@ -23,6 +24,18 @@ name: build-image-canon
 #   - PR events: build only (compile gate, no push).
 #   - push events: build + push to ghcr.io tagging <prefix>-<short_sha>
 #     and <prefix>-latest.
+#
+# LAYER CACHE (OPS, 2026-08-18):
+#   The build now imports/exports a BuildKit layer cache via the registry
+#   (`<image_name>:buildcache`), independent of which buildkitd replica the
+#   round-robin Service picks and persistent across pod restarts / GC. This
+#   is what makes cache hits deterministic instead of ~50% (they used to
+#   depend on landing on the replica whose PVC happened to hold the layers).
+#   The cache is READ on every event (PRs included, so the compile gate is
+#   fast too) and WRITTEN with mode=max (all intermediate stages, best hit
+#   rate for the multi-stage unified Dockerfiles). It is fully ADDITIVE:
+#   `ignore-error=true` on the exporter guarantees a cache push/pull problem
+#   degrades to a normal full build, never a red pipeline.
 
 on:
   workflow_call:
@@ -56,6 +69,11 @@ on:
         required: false
         type: string
         default: "tcp://buildkitd.buildkit-system.svc.cluster.local:1234"
+      cache_ref:
+        description: "Registry ref used for the shared BuildKit layer cache. Defaults to <image_name>:buildcache."
+        required: false
+        type: string
+        default: ""
     outputs:
       short_sha:
         description: "Short SHA (7 chars) of the built commit."
@@ -75,6 +93,12 @@ jobs:
       short_sha: ${{ steps.meta.outputs.short_sha }}
       tag_full: ${{ steps.meta.outputs.tag_full }}
     steps:
+      # OPTIONAL FUTURE OPTIMIZATION (documented, not applied here): bake the
+      # docker-buildx CLI plugin into the arc-runner image so this per-run
+      # `curl` disappears. It saves a few seconds per run and removes a
+      # GitHub-release network dependency, but it is a runner-image change
+      # (separate PR to the ARC runner Dockerfile) and is NOT required for the
+      # cache win below. Kept as an idempotent per-run install for now.
       - name: Install Docker buildx CLI
         shell: bash
         run: |
@@ -100,9 +124,22 @@ jobs:
           echo "tag_full=${{ inputs.tag_prefix }}-${short_sha}" >> "$GITHUB_OUTPUT"
           echo "tag_latest=${{ inputs.tag_prefix }}-latest" >> "$GITHUB_OUTPUT"
           echo "build_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          # Registry ref for the shared layer cache. Defaults to
+          # <image_name>:buildcache. It is a separate tag (a cache manifest),
+          # never a runnable image, so it does not collide with product tags.
+          cache_ref="${{ inputs.cache_ref }}"
+          [ -n "$cache_ref" ] || cache_ref="${{ inputs.image_name }}:buildcache"
+          echo "cache_ref=${cache_ref}" >> "$GITHUB_OUTPUT"
 
+      # CHANGED (OPS 2026-08-18): log in to GHCR on ALL events, not only on
+      # push. The registry layer cache lives in a (private) GHCR package, so
+      # both cache import (cache-from) and cache export (cache-to) need auth —
+      # including on PRs, where reading the warm cache is exactly what makes
+      # the compile gate fast. The `packages: write` permission above is
+      # already scoped to this job; the image itself is still only PUSHED on
+      # push events (see `push:` in the build step below), so PRs authenticate
+      # but never publish a product tag.
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -128,6 +165,16 @@ jobs:
           tags: |
             ${{ inputs.image_name }}:${{ steps.meta.outputs.tag_full }}
             ${{ inputs.image_name }}:${{ steps.meta.outputs.tag_latest }}
+          # Shared, replica-independent, persistent layer cache via the
+          # registry. Compatible with the remote buildkit driver: buildkitd
+          # itself performs the cache import/export against ghcr.io using the
+          # credentials forwarded from the login step. `mode=max` caches every
+          # intermediate stage (not just the final one) — the big win for the
+          # multi-stage Next.js unified builds. `ignore-error=true` keeps this
+          # strictly additive: if the cache cannot be read or written, the
+          # build falls back to a full build instead of failing.
+          cache-from: type=registry,ref=${{ steps.meta.outputs.cache_ref }}
+          cache-to: type=registry,ref=${{ steps.meta.outputs.cache_ref }},mode=max,ignore-error=true
           build-args: |
             GIT_SHA=${{ github.sha }}
             GIT_BRANCH=${{ github.ref_name }}
