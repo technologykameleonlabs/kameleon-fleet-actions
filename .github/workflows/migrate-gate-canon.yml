@@ -1,0 +1,259 @@
+name: migrate-gate-canon
+
+# Reusable workflow that turns a database migration into a PR gate.
+#
+# WHY THIS EXISTS (OPS incident, 2026-08-18):
+#   A Prisma migration added a CHECK constraint that EXISTING dev data
+#   violated. `prisma migrate deploy` failed at the deploy hook with
+#   Postgres error 23514, which left the migration half-applied and marked
+#   the whole migrations history as failed (Prisma P3009). From that point
+#   EVERY deploy of that product was blocked for >30 min until a human
+#   intervened. The migration compiled and reviewed fine — the failure was
+#   DATA-dependent, so nothing in CI saw it. This gate reproduces the deploy
+#   against a throwaway Postgres loaded with representative data, so the same
+#   class of failure turns a red PR check (2 min) instead of a frozen deploy
+#   lane.
+#
+# WHAT IT DOES on each PR:
+#   1. Boots an ephemeral Postgres 16 (service container).
+#   2. Brings that DB to the PRE-migration schema and loads a REPRESENTATIVE
+#      dataset (two supported sources, see `shadow_source`).
+#   3. Runs the repo's migration command (`prisma migrate deploy` by default),
+#      which now applies the PR's *new* migration ON TOP of real-shaped data.
+#   4. FAILS the PR if the migration errors (23514 / P3009 / anything).
+#
+# Usage from a product repo (add to the PR workflow):
+#
+#   jobs:
+#     migrate-gate:
+#       uses: technologykameleonlabs/kameleon-fleet-actions/.github/workflows/migrate-gate-canon.yml@main
+#       with:
+#         working_directory: .
+#         shadow_source: r2dump                 # or: seed
+#         shadow_dump_key: shadow/<product>/latest.sql.gz
+#       secrets: inherit
+#
+# See the companion example file for both invocation shapes.
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        description: "Directory holding package.json / prisma schema."
+        required: false
+        type: string
+        default: "."
+      node_version:
+        description: "Node.js version."
+        required: false
+        type: string
+        default: "20"
+      migrate_command:
+        description: "Command that applies pending migrations the way deploy does."
+        required: false
+        type: string
+        default: "npx prisma migrate deploy"
+      install_command:
+        description: "Dependency install command."
+        required: false
+        type: string
+        default: "npm ci"
+      shadow_source:
+        description: "Where the representative dataset comes from: 'r2dump' (recommended, sanitized nightly dump restored from R2) or 'seed' (repo's `prisma db seed`, minimum viable)."
+        required: false
+        type: string
+        default: "seed"
+      seed_command:
+        description: "Seed command used when shadow_source=seed."
+        required: false
+        type: string
+        default: "npx prisma db seed"
+      shadow_dump_key:
+        description: "R2 object key of the sanitized per-product dump used when shadow_source=r2dump (e.g. shadow/<product>/latest.sql.gz)."
+        required: false
+        type: string
+        default: ""
+      postgres_image:
+        description: "Postgres image for the shadow DB."
+        required: false
+        type: string
+        default: "postgres:16"
+      postgres_host:
+        description: "Host the job reaches Postgres on. 'localhost' for ARC host-mode runners (port published); set to 'postgres' if the runner executes jobs inside a container (ARC k8s/container mode)."
+        required: false
+        type: string
+        default: "localhost"
+      database_env:
+        description: "Name of the env var the migrate/seed commands read the connection string from."
+        required: false
+        type: string
+        default: "DATABASE_URL"
+    secrets:
+      # Only required when shadow_source=r2dump. Mirror the names used by the
+      # mvp-databases-dump-r2 cron so `secrets: inherit` just works if the
+      # product repo already has R2 backup secrets; otherwise set them at the
+      # org level. Optional so the seed path needs no secrets at all.
+      R2_ENDPOINT:
+        required: false
+      R2_BUCKET:
+        required: false
+      AWS_ACCESS_KEY_ID:
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        required: false
+
+jobs:
+  migrate-gate:
+    name: Migration gate (shadow DB)
+    # arc-runner (NO arc-runner-small): los service containers necesitan Docker,
+    # y solo el scale set `arc-runner` tiene dind. `arc-runner-small` offloadea a
+    # buildkitd remoto y NO tiene daemon docker -> el service `postgres` no arranca.
+    # (vitest-unit-canon y los CI de producto ya usan `arc-runner` por esto.)
+    runs-on: arc-runner
+    permissions:
+      contents: read
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: shadow
+          POSTGRES_PASSWORD: shadow
+          POSTGRES_DB: shadow
+        ports:
+          - 5432:5432
+        # Health check so the job only starts once the DB accepts connections.
+        options: >-
+          --health-cmd "pg_isready -U shadow -d shadow"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      # Connection string the migrate/seed commands consume. `${{ inputs.database_env }}`
+      # cannot be used as a key on the left of `env:`, so we export both a
+      # canonical DATABASE_URL and the (possibly custom) named var in a step.
+      DATABASE_URL: "postgresql://shadow:shadow@${{ inputs.postgres_host }}:5432/shadow?schema=public"
+
+    steps:
+      - name: Checkout (full history for base/head diff)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Export connection string under the repo's env var name
+        shell: bash
+        run: |
+          set -euo pipefail
+          # If the product reads a non-standard var (e.g. POSTGRES_PRISMA_URL),
+          # mirror DATABASE_URL onto it so the migrate/seed commands find it.
+          if [ "${{ inputs.database_env }}" != "DATABASE_URL" ]; then
+            echo "${{ inputs.database_env }}=${DATABASE_URL}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Wait for shadow Postgres
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if pg_isready -h "${{ inputs.postgres_host }}" -p 5432 -U shadow >/dev/null 2>&1; then
+              echo "postgres ready"; exit 0
+            fi
+            echo "waiting for postgres ($i)..."; sleep 2
+          done
+          echo "ERROR: shadow postgres never became ready"; exit 1
+
+      - name: Install dependencies
+        working-directory: ${{ inputs.working_directory }}
+        run: ${{ inputs.install_command }}
+
+      # ----------------------------------------------------------------------
+      # SOURCE A (recommended): restore a sanitized nightly dump from R2.
+      #
+      # The dump is a single-database, PII-sanitized snapshot of the product's
+      # dev DB, produced by the `mvp-databases-shadow-dump` cron (see the plan)
+      # and published at a STABLE key `shadow/<product>/latest.sql.gz`. Because
+      # dev has NOT yet applied the PR's migration, the dump carries the
+      # PRE-migration schema + real-shaped data + the `_prisma_migrations`
+      # history. Restoring it and then running `migrate deploy` applies ONLY
+      # the PR's pending migration against that data — an exact reproduction of
+      # the deploy hook, which is what catches the 23514/P3009 failure.
+      # ----------------------------------------------------------------------
+      - name: Restore representative dataset from R2 (shadow_source=r2dump)
+        if: inputs.shadow_source == 'r2dump'
+        working-directory: ${{ inputs.working_directory }}
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REGION: auto
+        run: |
+          set -euo pipefail
+          : "${R2_ENDPOINT:?shadow_source=r2dump needs R2_ENDPOINT secret}"
+          : "${R2_BUCKET:?shadow_source=r2dump needs R2_BUCKET secret}"
+          key="${{ inputs.shadow_dump_key }}"
+          [ -n "$key" ] || { echo "ERROR: shadow_dump_key input is required for r2dump"; exit 1; }
+          command -v aws >/dev/null 2>&1 || pip install --quiet awscli
+          echo "restoring s3://${R2_BUCKET}/${key} into shadow DB..."
+          # Stream: R2 -> gunzip -> psql. Stop on the first SQL error so a
+          # broken restore never masquerades as a passing gate.
+          aws s3 cp "s3://${R2_BUCKET}/${key}" - --endpoint-url "$R2_ENDPOINT" \
+            | gunzip \
+            | psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q
+          echo "restore complete."
+
+      - name: Apply pending migration against restored data (r2dump)
+        if: inputs.shadow_source == 'r2dump'
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          set -euo pipefail
+          echo "== applying PR migration on top of restored dev-shaped data =="
+          ${{ inputs.migrate_command }}
+
+      # ----------------------------------------------------------------------
+      # SOURCE B (minimum viable): repo seed.
+      #
+      # Reproduces the same "validate a new constraint over existing rows"
+      # failure without any external data:
+      #   1. checkout the PR BASE  -> migrate deploy (schema BEFORE this PR)
+      #   2. run the seed          -> representative rows in the OLD schema
+      #   3. checkout the PR HEAD  -> migrate deploy applies the NEW migration
+      #      on top of the seeded rows. If the seed carries rows that violate
+      #      the new constraint, this fails exactly like the real deploy.
+      # The gate is only as strong as the seed: it must contain representative
+      # (including edge-case) data, not a pristine happy-path fixture.
+      # ----------------------------------------------------------------------
+      - name: Baseline schema + seed at PR base (shadow_source=seed)
+        if: inputs.shadow_source == 'seed'
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          set -euo pipefail
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          echo "== checking out base ${base_sha} to build pre-migration schema =="
+          git checkout --quiet "$base_sha"
+          echo "== migrate deploy at base (schema without the PR migration) =="
+          ${{ inputs.migrate_command }}
+          echo "== seeding representative data into the base schema =="
+          ${{ inputs.seed_command }}
+
+      - name: Apply pending migration against seeded data (seed)
+        if: inputs.shadow_source == 'seed'
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          set -euo pipefail
+          head_sha="${{ github.event.pull_request.head.sha }}"
+          echo "== checking out head ${head_sha} =="
+          git checkout --quiet "$head_sha"
+          echo "== migrate deploy at head (applies the NEW migration on seeded data) =="
+          ${{ inputs.migrate_command }}
+
+      - name: Gate passed
+        run: |
+          echo "::notice title=Migration gate passed::${{ inputs.migrate_command }} succeeded against a representative shadow DB (source=${{ inputs.shadow_source }}). Deploy hook will not hit a data-dependent migration failure."
