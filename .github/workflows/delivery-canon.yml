@@ -105,10 +105,13 @@ on:
         type: string
         default: main
       tag_prefix:
-        description: "Prefijo de tag. Se publica <prefix>-<sha7> y <prefix>-latest."
+        description: >-
+          Prefijo de tag: se publica <prefix>-<sha7> y <prefix>-latest. Vacío = nombre de la
+          rama saneado (dev → dev-latest, main → main-latest). OJO: si el ImageUpdater del
+          producto mira `dev-latest` y su rama principal es `main`, hay que fijar `dev`.
         required: false
         type: string
-        default: dev
+        default: ""
       runs_on:
         description: "Runner para los builds. arc-runner-small delega en buildkitd; NO ocupa el carril grande."
         required: false
@@ -124,6 +127,29 @@ on:
         required: false
         type: string
         default: ""
+      also_tag_bare_prefix:
+        description: >-
+          Publicar TAMBIÉN `<image>:<prefix>` y `<image>:<sha7>` (sin guion). Compatibilidad
+          con consumidores que aún miran `:dev` (familia MVP: Deployments con tag mutable).
+        required: false
+        type: boolean
+        default: false
+      mount_core_token:
+        description: >-
+          Montar el secreto BuildKit `core_token` (id que esperan los Dockerfiles de la familia
+          MVP: `--mount=type=secret,id=core_token`) desde CORE_PACKAGES_TOKEN.
+        required: false
+        type: boolean
+        default: false
+      timeout_minutes:
+        description: "Timeout de cada build."
+        required: false
+        type: number
+        default: 30
+    secrets:
+      CORE_PACKAGES_TOKEN:
+        description: "Solo si mount_core_token=true. Con `secrets: inherit` llega solo."
+        required: false
     outputs:
       built:
         description: "JSON con los slots construidos en este run."
@@ -210,6 +236,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.to_build != '[]'
     runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
     permissions:
       contents: read
       packages: write
@@ -232,21 +259,39 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: Metadatos
+      - name: Metadatos y tags
         id: meta
         env:
           IMAGE: ${{ matrix.image }}
-          PREFIX: ${{ inputs.tag_prefix }}
+          PREFIX_IN: ${{ inputs.tag_prefix }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          BARE: ${{ inputs.also_tag_bare_prefix }}
         run: |
           set -euo pipefail
           short=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          # Prefijo: el input, o la rama saneada ([A-Za-z0-9._-]).
+          PREFIX="${PREFIX_IN:-$(echo "$REF_NAME" | tr -c 'A-Za-z0-9._-\n' '-')}"
+          if [[ "$REF" == refs/tags/* ]]; then
+            # Release: <image>:<vtag> y <image>:latest (esquema de squadwise-platform).
+            TAGS="${IMAGE}:${REF_NAME}"$'\n'"${IMAGE}:latest"
+            PRIMARY="${REF_NAME}"
+          else
+            TAGS="${IMAGE}:${PREFIX}-${short}"$'\n'"${IMAGE}:${PREFIX}-latest"
+            PRIMARY="${PREFIX}-${short}"
+            if [ "$BARE" = "true" ]; then
+              # Compatibilidad MVP: `:dev` y `:<sha7>` mientras sus Deployments miren tags mutables.
+              TAGS="${TAGS}"$'\n'"${IMAGE}:${PREFIX}"$'\n'"${IMAGE}:${short}"
+            fi
+          fi
           {
-            echo "tag_full=${PREFIX}-${short}"
-            echo "tag_latest=${PREFIX}-latest"
+            echo "tag_primary=${PRIMARY}"
             echo "cache_ref=${IMAGE}:buildcache"
             echo "build_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "push=${{ github.event_name != 'pull_request' }}"
+            echo "tags<<EOF"; echo "$TAGS"; echo "EOF"
           } >> "$GITHUB_OUTPUT"
+          echo "::notice title=tags ${{ matrix.slot }}::$(echo "$TAGS" | tr '\n' ' ')"
 
       - name: Login GHCR
         uses: docker/login-action@v3
@@ -259,10 +304,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          docker buildx rm kameleon-canon >/dev/null 2>&1 || true
           docker buildx create --name kameleon-canon --driver remote "${{ inputs.buildkitd_endpoint }}" --use \
             || { echo "::error title=delivery-canon/buildkit::no pude crear el builder remoto contra ${{ inputs.buildkitd_endpoint }}"; exit 1; }
-          docker buildx inspect --bootstrap kameleon-canon >/dev/null \
-            || { echo "::error title=delivery-canon/buildkit::buildkitd no responde en ${{ inputs.buildkitd_endpoint }} (¿pod caído? ¿cuota?)"; exit 1; }
+          # buildkitd puede tardar en aceptar la sesión (2 réplicas tras un Service):
+          # 10 intentos × 15 s, como ya hacía la familia MVP.
+          for i in $(seq 1 10); do
+            docker buildx inspect --bootstrap kameleon-canon >/dev/null 2>&1 && exit 0
+            echo "buildkitd aún no responde (intento $i/10)"; sleep 15
+          done
+          echo "::error title=delivery-canon/buildkit::buildkitd no responde en ${{ inputs.buildkitd_endpoint }} tras 150 s (¿pods caídos? ¿cuota del ns?)"
+          exit 1
 
       - name: Build (PR) o Build & push
         id: build
@@ -271,10 +323,20 @@ jobs:
           context: ${{ matrix.context || '.' }}
           file: ${{ matrix.dockerfile || 'Dockerfile' }}
           target: ${{ matrix.target || '' }}
+          platforms: linux/amd64
+          # Sin attestations de provenance: un manifest simple por tag. Es lo que
+          # ya hacía la familia MVP y evita índices que confunden a quien resuelve
+          # digests (argocd-image-updater, `crane digest`).
+          provenance: false
           push: ${{ steps.meta.outputs.push == 'true' }}
-          tags: |
-            ${{ matrix.image }}:${{ steps.meta.outputs.tag_full }}
-            ${{ matrix.image }}:${{ steps.meta.outputs.tag_latest }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.ref.name=${{ github.ref_name }}
+          # Secreto BuildKit para Dockerfiles con `--mount=type=secret,id=core_token`
+          # (familia MVP: instala @technologykameleonlabs/* desde GitHub Packages).
+          secrets: ${{ inputs.mount_core_token && format('core_token={0}', secrets.CORE_PACKAGES_TOKEN) || '' }}
           cache-from: type=registry,ref=${{ steps.meta.outputs.cache_ref }}
           cache-to: type=registry,ref=${{ steps.meta.outputs.cache_ref }},mode=max,ignore-error=true
           build-args: |
@@ -292,7 +354,7 @@ jobs:
         run: |
           if [ "$OUTCOME" = "success" ]; then
             if [ "${{ steps.meta.outputs.push }}" = "true" ]; then
-              echo "::notice title=Imagen publicada::${{ matrix.image }}:${{ steps.meta.outputs.tag_full }} y :${{ steps.meta.outputs.tag_latest }} (digest ${{ steps.build.outputs.digest }})"
+              echo "::notice title=Imagen publicada::${{ matrix.image }} → $(echo '${{ steps.meta.outputs.tags }}' | sed 's|.*:||' | tr '\n' ' ') (digest ${{ steps.build.outputs.digest }})"
             else
               echo "::notice title=Compile gate OK::${{ matrix.slot }} construye. No se publica en PR."
             fi
