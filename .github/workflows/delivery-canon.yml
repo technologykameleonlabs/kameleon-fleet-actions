@@ -276,7 +276,7 @@ jobs:
           set -euo pipefail
           short=$(echo "${GITHUB_SHA}" | cut -c1-7)
           # Prefijo: el input, o la rama saneada ([A-Za-z0-9._-]).
-          PREFIX="${PREFIX_IN:-$(echo "$REF_NAME" | tr -c 'A-Za-z0-9._-\n' '-')}"
+          PREFIX="${PREFIX_IN:-$(echo "$REF_NAME" | tr -c 'A-Za-z0-9._\n-' '-')}"
           if [[ "$REF" == refs/tags/* ]]; then
             # Release: <image>:<vtag> y <image>:latest (esquema de squadwise-platform).
             TAGS="${IMAGE}:${REF_NAME}"$'\n'"${IMAGE}:latest"
