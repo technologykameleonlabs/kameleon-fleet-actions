@@ -1,0 +1,301 @@
+name: delivery-canon
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LA RECETA DE ENTREGA DE LA FLOTA — una sola, reutilizable, para todos.
+#
+# Cubre el tramo «commit en la rama principal → imágenes publicadas en GHCR».
+# Lo que pasa después (argocd-image-updater ve el digest nuevo de
+# `:<prefix>-latest` y ArgoCD despliega) ya es uniforme en el clúster y no
+# vive aquí.
+#
+# Cada producto tiene un STUB de ~20 líneas que llama a esta receta con sus
+# imágenes. Cambiar la receta aquí cambia la entrega de todos los productos a
+# la vez. Nadie copia este fichero: quien lo copia, deriva (OPS-4026: la
+# copia de squadwise-platform del gate adversarial se fosilizó y tumbó la
+# puerta de toda la flota).
+#
+# QUÉ HACE, y por qué cada cosa (todo esto se MIDIÓ en squadwise-platform,
+# 24/25-ago-2026, ficha OPS-4024):
+#
+#   1. `changes` decide qué imágenes hay que construir.
+#      - pull_request: solo las cuyas rutas tocó la PR (dorny/paths-filter con
+#        el mapa `filters`). Ahorra minutos de runner en cada PR.
+#      - push a la rama principal / workflow_dispatch / tag: TODAS, siempre.
+#        Acotar por diff en la rama principal PIERDE despliegues en silencio:
+#        un run cancelado por otro push pierde su build, el push siguiente ya
+#        no ve esos ficheros en su diff, y la imagen no se publica nunca —
+#        con todo en verde. Se midió: tres PR mergeadas, CI verde, ninguna en
+#        el clúster. Reconstruir siempre cuesta minutos de caché; perder un
+#        despliegue sin decirlo cuesta horas de diagnóstico.
+#
+#   2. `build` construye TODAS las imágenes EN PARALELO, una por fila de la
+#      matriz, y NO espera a ningún check de calidad del producto. El gate de
+#      calidad ocurrió en la PR, antes de mergear; en la rama principal los
+#      checks son informativos. Medido: serializar checks (10 min) + build
+#      (7,7 min) doblaba el reloj de cada entrega.
+#
+#   3. Cada build corre en `arc-runner-small` y delega en el buildkitd del
+#      clúster con caché de capas en el registro (`<imagen>:buildcache`,
+#      mode=max, additiva: si la caché falla, build completo, nunca rojo).
+#      Deja libre el carril grande (arc-runner), que es la cola que ahoga a la
+#      flota en horas punta.
+#
+#   4. En PR construye SIN publicar (compile gate). En push publica
+#      `<prefix>-<sha7>` y `<prefix>-latest`.
+#
+#   5. Falla DICIENDO por qué: cada build que no puede correr deja una
+#      anotación `::error` con taxonomía (`config`, `buildkit`, `registry`),
+#      no un «exit 1» mudo.
+#
+# CÓMO SE USA (stub del producto, `.github/workflows/ci.yml`):
+#
+#   name: CI
+#   on:
+#     pull_request:
+#     push:
+#       branches: [main]          # o [dev] en los MVP
+#       tags: ['v*.*.*']
+#     workflow_dispatch:
+#   concurrency:
+#     group: ci-${{ github.ref }}
+#     cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}   # NUNCA en la principal
+#   jobs:
+#     delivery:
+#       uses: technologykameleonlabs/kameleon-fleet-actions/.github/workflows/delivery-canon.yml@v1
+#       with:
+#         default_branch: main
+#         images: |
+#           [
+#             {"slot":"api","image":"ghcr.io/technologykameleonlabs/miproducto-api",
+#              "dockerfile":"docker/Dockerfile.api","context":".","target":"runner"},
+#             {"slot":"web","image":"ghcr.io/technologykameleonlabs/miproducto-web",
+#              "dockerfile":"docker/Dockerfile.web","context":"."}
+#           ]
+#         filters: |
+#           api: ['apps/api/**','packages/**','docker/Dockerfile.api','pnpm-lock.yaml']
+#           web: ['apps/web/**','packages/**','docker/Dockerfile.web','pnpm-lock.yaml']
+#       secrets: inherit
+#
+# VERSIONADO: los stubs apuntan a `@v1`. Un cambio en la receta se prueba en
+# el canario (squadwise-platform apunta a `@main`) y, cuando está verde, se
+# mueve la etiqueta `v1`. Así un error en la receta no rompe a toda la flota
+# a la vez.
+# ═══════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_call:
+    inputs:
+      images:
+        description: >-
+          JSON: lista de imágenes. Cada una: {slot, image, dockerfile?, context?,
+          target?, build_args?}. `slot` enlaza con `filters`; `image` es el nombre
+          completo sin tag.
+        required: true
+        type: string
+      filters:
+        description: >-
+          YAML (formato dorny/paths-filter): mapa slot -> lista de globs. Un slot
+          sin entrada se construye SIEMPRE.
+        required: false
+        type: string
+        default: ""
+      default_branch:
+        description: "Rama principal del producto. Un push a ella reconstruye TODO."
+        required: false
+        type: string
+        default: main
+      tag_prefix:
+        description: "Prefijo de tag. Se publica <prefix>-<sha7> y <prefix>-latest."
+        required: false
+        type: string
+        default: dev
+      runs_on:
+        description: "Runner para los builds. arc-runner-small delega en buildkitd; NO ocupa el carril grande."
+        required: false
+        type: string
+        default: arc-runner-small
+      buildkitd_endpoint:
+        description: "buildkitd del clúster."
+        required: false
+        type: string
+        default: "tcp://buildkitd.buildkit-system.svc.cluster.local:1234"
+      extra_build_args:
+        description: "build-args comunes a todas las imágenes (multilínea KEY=VAL)."
+        required: false
+        type: string
+        default: ""
+    outputs:
+      built:
+        description: "JSON con los slots construidos en este run."
+        value: ${{ jobs.changes.outputs.to_build }}
+      short_sha:
+        description: "SHA corto del commit construido."
+        value: ${{ jobs.changes.outputs.short_sha }}
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────
+  # Decide qué construir. Barato: un runner pequeño, segundos.
+  # ───────────────────────────────────────────────────────────────────────
+  changes:
+    name: qué construir
+    runs-on: arc-runner-small
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      force_all: ${{ steps.decide.outputs.force_all }}
+      changed: ${{ steps.filter.outputs.changes }}
+      to_build: ${{ steps.decide.outputs.to_build }}
+      short_sha: ${{ steps.decide.outputs.short_sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Filtro de rutas (solo informa en PR)
+        id: filter
+        if: github.event_name == 'pull_request' && inputs.filters != ''
+        uses: dorny/paths-filter@v3
+        with:
+          filters: ${{ inputs.filters }}
+
+      - name: Decidir
+        id: decide
+        env:
+          IMAGES: ${{ inputs.images }}
+          FILTER_CHANGED: ${{ steps.filter.outputs.changes }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ inputs.default_branch }}
+        run: |
+          set -euo pipefail
+          echo "short_sha=$(echo "${GITHUB_SHA}" | cut -c1-7)" >> "$GITHUB_OUTPUT"
+          FORCE=false
+          # Rama principal, dispatch o tag: TODO. Ver cabecera — acotar aquí
+          # pierde despliegues en silencio.
+          if [ "$EVENT" = "workflow_dispatch" ]; then FORCE=true
+          elif [ "$EVENT" = "push" ] && [[ "$REF" == refs/tags/* ]]; then FORCE=true
+          elif [ "$EVENT" = "push" ] && [ "$REF" = "refs/heads/${DEFAULT_BRANCH}" ]; then FORCE=true
+          elif [ "$EVENT" = "push" ]; then
+            # push a otra rama (p.ej. una rama de release): también todo.
+            FORCE=true
+          fi
+          echo "force_all=$FORCE" >> "$GITHUB_OUTPUT"
+
+          # Validar el JSON de imágenes AQUÍ, con mensaje, y no dejar que
+          # fromJSON explote más tarde con un error críptico.
+          if ! echo "$IMAGES" | jq -e 'type=="array" and length>0 and all(.[]; has("slot") and has("image"))' >/dev/null; then
+            echo "::error title=delivery-canon config::\`images\` debe ser un array JSON no vacío de objetos con \`slot\` e \`image\`"
+            exit 1
+          fi
+
+          if [ "$FORCE" = "true" ]; then
+            TO_BUILD=$(echo "$IMAGES" | jq -c '.')
+          else
+            # PR: solo los slots tocados, o los que no tienen filtro (siempre).
+            CHANGED=$(echo "${FILTER_CHANGED:-[]}" | jq -c 'if type=="array" then . else [] end')
+            TO_BUILD=$(echo "$IMAGES" | jq -c --argjson ch "$CHANGED" --arg has_filters "${{ inputs.filters != '' }}" '
+              map(select(
+                ($has_filters != "true")            # sin mapa de filtros: todo
+                or (.slot as $s | $ch | index($s) != null)
+              ))')
+          fi
+          echo "to_build=$TO_BUILD" >> "$GITHUB_OUTPUT"
+          echo "::notice title=delivery-canon::evento=$EVENT force_all=$FORCE a construir=$(echo "$TO_BUILD" | jq -r 'map(.slot)|join(",")')"
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Construye. Una fila de matriz por imagen, EN PARALELO, sin esperar a
+  # nadie. Solo depende de `changes`.
+  # ───────────────────────────────────────────────────────────────────────
+  build:
+    name: build ${{ matrix.slot }}
+    needs: changes
+    if: needs.changes.outputs.to_build != '[]'
+    runs-on: ${{ inputs.runs_on }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.changes.outputs.to_build) }}
+    steps:
+      - name: Instalar docker buildx (idempotente)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if docker buildx version >/dev/null 2>&1; then exit 0; fi
+          mkdir -p "$HOME/.docker/cli-plugins"
+          curl -fsSLo "$HOME/.docker/cli-plugins/docker-buildx" \
+            "https://github.com/docker/buildx/releases/download/v0.18.0/buildx-v0.18.0.linux-amd64" \
+            || { echo "::error title=delivery-canon/buildkit::no pude descargar docker-buildx (red o GitHub releases)"; exit 1; }
+          chmod +x "$HOME/.docker/cli-plugins/docker-buildx"
+          docker buildx version
+
+      - uses: actions/checkout@v4
+
+      - name: Metadatos
+        id: meta
+        env:
+          IMAGE: ${{ matrix.image }}
+          PREFIX: ${{ inputs.tag_prefix }}
+        run: |
+          set -euo pipefail
+          short=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          {
+            echo "tag_full=${PREFIX}-${short}"
+            echo "tag_latest=${PREFIX}-latest"
+            echo "cache_ref=${IMAGE}:buildcache"
+            echo "build_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "push=${{ github.event_name != 'pull_request' }}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Login GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Conectar con buildkitd del clúster
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx create --name kameleon-canon --driver remote "${{ inputs.buildkitd_endpoint }}" --use \
+            || { echo "::error title=delivery-canon/buildkit::no pude crear el builder remoto contra ${{ inputs.buildkitd_endpoint }}"; exit 1; }
+          docker buildx inspect --bootstrap kameleon-canon >/dev/null \
+            || { echo "::error title=delivery-canon/buildkit::buildkitd no responde en ${{ inputs.buildkitd_endpoint }} (¿pod caído? ¿cuota?)"; exit 1; }
+
+      - name: Build (PR) o Build & push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context || '.' }}
+          file: ${{ matrix.dockerfile || 'Dockerfile' }}
+          target: ${{ matrix.target || '' }}
+          push: ${{ steps.meta.outputs.push == 'true' }}
+          tags: |
+            ${{ matrix.image }}:${{ steps.meta.outputs.tag_full }}
+            ${{ matrix.image }}:${{ steps.meta.outputs.tag_latest }}
+          cache-from: type=registry,ref=${{ steps.meta.outputs.cache_ref }}
+          cache-to: type=registry,ref=${{ steps.meta.outputs.cache_ref }},mode=max,ignore-error=true
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            GIT_BRANCH=${{ github.ref_name }}
+            BUILD_SHA=${{ github.sha }}
+            BUILD_AT=${{ steps.meta.outputs.build_at }}
+            ${{ inputs.extra_build_args }}
+            ${{ matrix.build_args || '' }}
+
+      - name: Resultado
+        if: always()
+        env:
+          OUTCOME: ${{ steps.build.outcome }}
+        run: |
+          if [ "$OUTCOME" = "success" ]; then
+            if [ "${{ steps.meta.outputs.push }}" = "true" ]; then
+              echo "::notice title=Imagen publicada::${{ matrix.image }}:${{ steps.meta.outputs.tag_full }} y :${{ steps.meta.outputs.tag_latest }} (digest ${{ steps.build.outputs.digest }})"
+            else
+              echo "::notice title=Compile gate OK::${{ matrix.slot }} construye. No se publica en PR."
+            fi
+          else
+            echo "::error title=delivery-canon/build ${{ matrix.slot }}::el build de ${{ matrix.image }} falló (${OUTCOME}). Mira el paso 'Build' de este job: es el Dockerfile o el código, no la receta."
+          fi

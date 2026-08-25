@@ -80,3 +80,29 @@ One PR per product migrates the build & test workflows. Zero infra configuration
 
 - `arc-runner` maxRunners: edit `AutoscalingRunnerSet` in `arc-runners` namespace.
 - `buildkitd` replicas: edit the Deployment in `buildkit-system`. PVC is RWO (1 replica only) — to scale, switch to RWX storage class first.
+
+### `delivery-canon.yml` — la receta de entrega de la flota
+
+Construye **todas las imágenes de un producto en paralelo** y las publica en GHCR. Es la receta única del tramo *commit → imagen*; el tramo *imagen → clúster* lo hace `argocd-image-updater` + ArgoCD igual para todos.
+
+```yaml
+jobs:
+  delivery:
+    uses: technologykameleonlabs/kameleon-fleet-actions/.github/workflows/delivery-canon.yml@v1
+    with:
+      default_branch: main
+      images: |
+        [{"slot":"api","image":"ghcr.io/technologykameleonlabs/miproducto-api","dockerfile":"docker/Dockerfile.api"}]
+      filters: |
+        api: ['apps/api/**','packages/**','docker/Dockerfile.api','pnpm-lock.yaml']
+    secrets: inherit
+```
+
+Lo que garantiza, medido en squadwise-platform (OPS-4024):
+- **PR**: construye solo lo que la PR toca (compile gate, sin publicar).
+- **Rama principal / dispatch / tag**: reconstruye **todo, siempre** — acotar por diff en la principal pierde despliegues en silencio.
+- **Builds en paralelo**, sin esperar a checks de calidad (el gate fue la PR).
+- `arc-runner-small` + buildkitd del clúster + caché en registro: no ocupa el carril grande.
+- Cada fallo deja `::error` con taxonomía (`config` / `buildkit` / `build <slot>`).
+
+**Versionado:** los stubs apuntan a `@v1`. El canario (`squadwise-platform`) apunta a `@main`; la etiqueta `v1` se mueve cuando el canario está verde.
