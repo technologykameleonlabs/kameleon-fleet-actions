@@ -251,9 +251,14 @@ jobs:
           set -euo pipefail
           if docker buildx version >/dev/null 2>&1; then exit 0; fi
           mkdir -p "$HOME/.docker/cli-plugins"
-          curl -fsSLo "$HOME/.docker/cli-plugins/docker-buildx" \
-            "https://github.com/docker/buildx/releases/download/v0.18.0/buildx-v0.18.0.linux-amd64" \
-            || { echo "::error title=delivery-canon/buildkit::no pude descargar docker-buildx (red o GitHub releases)"; exit 1; }
+          # GitHub releases devuelve 429/5xx con cierta frecuencia desde el
+          # clúster (visto en kameleonapp-lab#2723): 3 intentos con espera.
+          for i in 1 2 3; do
+            curl -fsSLo "$HOME/.docker/cli-plugins/docker-buildx" \
+              "https://github.com/docker/buildx/releases/download/v0.18.0/buildx-v0.18.0.linux-amd64" && break
+            echo "descarga de buildx fallida (intento $i/3)"; sleep 10
+            [ "$i" = "3" ] && { echo "::error title=delivery-canon/buildkit::no pude descargar docker-buildx tras 3 intentos (red o GitHub releases)"; exit 1; }
+          done
           chmod +x "$HOME/.docker/cli-plugins/docker-buildx"
           docker buildx version
 
