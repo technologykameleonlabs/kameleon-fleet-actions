@@ -1,0 +1,87 @@
+name: design-tokens-gate
+
+# OPS-4393 (origen KAM-1160, frente C) — gate BLOQUEANTE del sistema de tokens
+# de diseño, reutilizable por el seed y por todos los MVPs.
+#
+# Canon del PO: «cerrar la puerta ABSOLUTAMENTE a que se construya nada fuera
+# de ser referenciado al sistema de tokens de diseño». Este workflow es la
+# ÚNICA definición del gate: los repos consumidores lo invocan, no lo copian,
+# para que no haya N variantes divergiendo.
+#
+# Usage:
+#   jobs:
+#     design-tokens:
+#       uses: technologykameleonlabs/kameleon-fleet-actions/.github/workflows/design-tokens-gate.yml@main
+#       with:
+#         guard_path: 'scripts/check-token-colors.mjs'
+#
+# Por qué NO instala dependencias: el guard es deliberadamente portable — sólo
+# usa `node:fs`, `node:child_process` y `git`. Medido: 0.07s en product-seed,
+# 0.3s en kameleonapp-lab. Un `pnpm install --frozen-lockfile` aquí multiplicaría
+# por cien el coste del gate y le añadiría un modo de fallo (lockfile) que nada
+# tiene que ver con los colores.
+#
+# Por qué el guard vive en el repo CONSUMIDOR y no aquí: cada repo declara sus
+# propias exenciones (paletas que son dato de usuario, HTML de email…) y esa
+# lista es parte del código que audita. Lo que se comparte es la EJECUCIÓN del
+# gate y su severidad, no la política de cada repo.
+
+on:
+  workflow_call:
+    inputs:
+      guard_path:
+        description: "Ruta del guard de tokens dentro del repo consumidor."
+        required: false
+        type: string
+        default: "scripts/check-token-colors.mjs"
+      node_version:
+        description: "Node.js version."
+        required: false
+        type: string
+        default: "20"
+      runs_on:
+        description: "Runner label. Por defecto el self-hosted in-cluster."
+        required: false
+        type: string
+        default: "arc-runner-small"
+
+jobs:
+  design-tokens:
+    name: design-tokens
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: El guard tiene que EXISTIR (un gate que aprueba por AUSENCIA es el fallo que corregimos)
+        # Criterio de aceptación literal de OPS-4393: si un repo consumidor
+        # invoca este workflow sin tener el script, el gate debe ponerse ROJO
+        # con un mensaje explícito — jamás pasar en verde por no encontrar nada
+        # que comprobar. Es el mismo defecto que este gate viene a cerrar.
+        env:
+          GUARD: ${{ inputs.guard_path }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$GUARD" ]; then
+            echo "::error::El guard de tokens '$GUARD' NO existe en este repositorio. El gate no puede ejecutarse y se declara ROJO en vez de aprobar por ausencia. Añade el guard (o corrige guard_path) antes de invocar design-tokens-gate."
+            exit 1
+          fi
+          echo "guard encontrado: $GUARD"
+
+      - name: check-token-colors
+        # Sin `continue-on-error`, sin `|| true` y sin tubería: el exit code del
+        # guard ES el veredicto del gate y tiene que llegar intacto al job. Una
+        # `|` intermedia devolvería el estado del último comando del pipe y
+        # taparía el fallo — que es literalmente cómo se perdió esta señal antes.
+        env:
+          GUARD: ${{ inputs.guard_path }}
+        run: node "$GUARD"
