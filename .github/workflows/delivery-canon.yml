@@ -299,6 +299,7 @@ jobs:
           echo "::notice title=tags ${{ matrix.slot }}::$(echo "$TAGS" | tr '\n' ' ')"
 
       - name: Login GHCR
+        id: login_ghcr
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -306,6 +307,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Conectar con buildkitd del clúster
+        id: buildkitd
         shell: bash
         run: |
           set -euo pipefail
@@ -356,13 +358,34 @@ jobs:
         if: always()
         env:
           OUTCOME: ${{ steps.build.outcome }}
+          LOGIN_GHCR: ${{ steps.login_ghcr.outcome }}
+          BUILDKITD: ${{ steps.buildkitd.outcome }}
         run: |
+          # OPS-5036 (5-sep-2026): esto era un `if/else` de DOS ramas para un
+          # campo de CUATRO valores (`success`/`failure`/`cancelled`/`skipped`).
+          # Con `skipped` caia en el `else` y soltaba dos afirmaciones falsas en
+          # una linea: decia «fallo» un paso que NO se ejecuto, y atribuia la
+          # causa al Dockerfile del usuario justo cuando quien se cayo fue un
+          # paso de la PROPIA receta. Reportado desde squadwise-platform#387: un
+          # `TLS handshake timeout` en `Login GHCR` mandaba a mirar el codigo.
+          # La prueba que lo desmentia iba impresa en la misma frase: `(skipped)`.
           if [ "$OUTCOME" = "success" ]; then
             if [ "${{ steps.meta.outputs.push }}" = "true" ]; then
               echo "::notice title=Imagen publicada::${{ matrix.image }} → $(echo '${{ steps.meta.outputs.tags }}' | sed 's|.*:||' | tr '\n' ' ') (digest ${{ steps.build.outputs.digest }})"
             else
               echo "::notice title=Compile gate OK::${{ matrix.slot }} construye. No se publica en PR."
             fi
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "::error title=delivery-canon/build ${{ matrix.slot }}::el build de ${{ matrix.image }} FALLÓ. Mira el paso 'Build' de este job: es el Dockerfile o el código, no la receta."
           else
-            echo "::error title=delivery-canon/build ${{ matrix.slot }}::el build de ${{ matrix.image }} falló (${OUTCOME}). Mira el paso 'Build' de este job: es el Dockerfile o el código, no la receta."
+            # El build NO llego a ejecutarse. Aqui NO se atribuye causa: se
+            # nombra el paso anterior que si fallo, que es de la receta.
+            CULPABLE=""
+            [ "$LOGIN_GHCR" = "failure" ] && CULPABLE="Login GHCR"
+            [ -z "$CULPABLE" ] && [ "$BUILDKITD" = "failure" ] && CULPABLE="Conectar con buildkitd del clúster"
+            if [ -n "$CULPABLE" ]; then
+              echo "::error title=delivery-canon/build ${{ matrix.slot }}::el build de ${{ matrix.image }} NO se ejecutó (outcome=${OUTCOME}): falló antes el paso «${CULPABLE}», que es de la receta y no de tu repositorio. NO mires tu Dockerfile: suele ser un problema de red o de registro y se reintenta."
+            else
+              echo "::error title=delivery-canon/build ${{ matrix.slot }}::el build de ${{ matrix.image }} NO se ejecutó (outcome=${OUTCOME}). Falló o se canceló algo antes del paso 'Build'; mira los pasos anteriores de este job. NO se puede atribuir la causa a tu Dockerfile: no llegó a compilarse."
+            fi
           fi
