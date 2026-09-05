@@ -1,0 +1,29 @@
+# OPS-5036: este repositorio publica recetas reutilizables que gobiernan la
+# entrega de TODA la flota, y hasta ahora no tenia ninguna CI propia. Una prueba
+# que nadie ejecuta no es una prueba: es documentacion que envejece.
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar PyYAML
+        run: python3 -m pip install --quiet pyyaml
+      - name: Pruebas de las recetas
+        run: |
+          set -euo pipefail
+          fallos=0
+          for t in tests/*.sh; do
+            echo "── $t"
+            bash "$t" || fallos=$((fallos+1))
+          done
+          [ "$fallos" -eq 0 ] || { echo "::error::$fallos fichero(s) de prueba en rojo"; exit 1; }
