@@ -117,6 +117,30 @@ on:
         required: false
         type: string
         default: arc-runner-small
+      # OPS-5351 fase 2 (08-sep-2026): cache remota de turbo DENTRO del Docker
+      # build. El paso mas caro del build de squadwise-api es `pnpm turbo run
+      # build` (365 s medidos); con cache remota, un paquete sin cambios cuesta
+      # segundos. Los tres llegan como build-args; el Dockerfile que quiera
+      # usarlos declara `ARG TURBO_API TURBO_TEAM TURBO_TOKEN` y los exporta
+      # solo en el RUN de turbo. Los que no los declaran reciben un aviso de
+      # buildx («build-args not consumed») y nada mas. El servidor esta en el
+      # cluster (infra-k8s k8s/ci-cache) sin auth, acotado por NetworkPolicy a
+      # buildkitd y runners: el token es un literal cualquiera, no un secreto.
+      turbo_api:
+        description: "URL de la cache remota de turbo (vacia = sin cache remota)."
+        type: string
+        required: false
+        default: "http://turbo-cache.ci-cache.svc.cluster.local:3000"
+      turbo_team:
+        description: "Equipo para la cache remota de turbo (cualquier literal; el servidor no lo valida)."
+        type: string
+        required: false
+        default: "kameleonlabs"
+      turbo_token:
+        description: "Token para la cache remota (literal; el servidor corre AUTH_MODE=none tras NetworkPolicy)."
+        type: string
+        required: false
+        default: "ci"
       buildkitd_endpoint:
         description: "buildkitd del clúster."
         required: false
@@ -351,6 +375,9 @@ jobs:
             GIT_BRANCH=${{ github.ref_name }}
             BUILD_SHA=${{ github.sha }}
             BUILD_AT=${{ steps.meta.outputs.build_at }}
+            TURBO_API=${{ inputs.turbo_api }}
+            TURBO_TEAM=${{ inputs.turbo_team }}
+            TURBO_TOKEN=${{ inputs.turbo_token }}
             ${{ inputs.extra_build_args }}
             ${{ matrix.build_args || '' }}
 
