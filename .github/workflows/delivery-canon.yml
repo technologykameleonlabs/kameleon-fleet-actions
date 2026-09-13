@@ -185,10 +185,15 @@ on:
 jobs:
   # ───────────────────────────────────────────────────────────────────────
   # Decide qué construir. Barato: un runner pequeño, segundos.
+  # Corre en el MISMO carril que los builds (`inputs.runs_on`, por defecto arc-runner-small):
+  # si un llamador manda sus builds a otro carril para no esperar la cola compartida, este
+  # paso previo no puede quedarse atrás en ella, porque los builds dependen de él. Medido el
+  # 13-sep en squadwise-platform: con los builds de main en arc-runner-main, «qué construir»
+  # seguía esperando en arc-runner-small lleno (20/20) y el despliegue no avanzaba.
   # ───────────────────────────────────────────────────────────────────────
   changes:
     name: qué construir
-    runs-on: arc-runner-small
+    runs-on: ${{ inputs.runs_on }}
     permissions:
       contents: read
       pull-requests: read
