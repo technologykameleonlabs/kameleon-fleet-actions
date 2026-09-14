@@ -40,8 +40,20 @@ name: delivery-canon
 #      Deja libre el carril grande (arc-runner), que es la cola que ahoga a la
 #      flota en horas punta.
 #
-#   4. En PR construye SIN publicar (compile gate). En push publica
-#      `<prefix>-<sha7>` y `<prefix>-latest`.
+#   4. PUBLICA SOLO desde la rama principal (`refs/heads/<default_branch>`) o
+#      un tag (`refs/tags/*`). Cualquier otro caso —PR, `workflow_dispatch`
+#      sobre una rama de PR, push a otra rama— construye SIN publicar (compile
+#      gate) y lo dice con `::notice`. «Construir TODO» (punto 1) y «publicar»
+#      son decisiones DISTINTAS: la primera protege contra perder despliegues;
+#      la segunda protege el entorno.
+#      Por qué (OPS-6605, medido el 14-sep-2026 en squadwise-platform): la
+#      receta publicaba con `push = event != pull_request`, así que un
+#      `gh workflow run ci.yml --ref <rama-de-PR>` publicó `dev-<sha>` y
+#      `dev-latest` de una rama de PR en GHCR; argocd-image-updater
+#      (estrategia newest-build) desplegó en dev un commit que NO estaba en
+#      main (78f899df, 60/30 divergido) y dev sirvió código de una rama
+#      durante horas. El dispatch sigue reconstruyendo todo (FORCE), pero
+#      fuera de la principal no toca el registro.
 #
 #   5. Falla DICIENDO por qué: cada build que no puede correr deja una
 #      anotación `::error` con taxonomía (`config`, `buildkit`, `registry`),
@@ -225,7 +237,8 @@ jobs:
           echo "short_sha=$(echo "${GITHUB_SHA}" | cut -c1-7)" >> "$GITHUB_OUTPUT"
           FORCE=false
           # Rama principal, dispatch o tag: TODO. Ver cabecera — acotar aquí
-          # pierde despliegues en silencio.
+          # pierde despliegues en silencio. OJO: FORCE decide QUÉ construir, no
+          # si se publica; eso lo decide `build` mirando la ref (OPS-6605).
           if [ "$EVENT" = "workflow_dispatch" ]; then FORCE=true
           elif [ "$EVENT" = "push" ] && [[ "$REF" == refs/tags/* ]]; then FORCE=true
           elif [ "$EVENT" = "push" ] && [ "$REF" = "refs/heads/${DEFAULT_BRANCH}" ]; then FORCE=true
@@ -301,9 +314,22 @@ jobs:
           REF: ${{ github.ref }}
           REF_NAME: ${{ github.ref_name }}
           BARE: ${{ inputs.also_tag_bare_prefix }}
+          EVENT: ${{ github.event_name }}
+          DEFAULT_BRANCH: ${{ inputs.default_branch }}
         run: |
           set -euo pipefail
           short=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          # Publicar SOLO desde la rama principal o un tag (OPS-6605, ver
+          # cabecera). No basta con `event != pull_request`: un dispatch sobre
+          # una rama de PR es un push a GHCR que el ImageUpdater despliega.
+          PUSH=false
+          if [ "$EVENT" != "pull_request" ]; then
+            if [[ "$REF" == refs/tags/* ]] || [ "$REF" = "refs/heads/${DEFAULT_BRANCH}" ]; then
+              PUSH=true
+            else
+              echo "::notice title=Compile gate ${{ matrix.slot }}::evento=${EVENT} ref=${REF} no es refs/heads/${DEFAULT_BRANCH} ni un tag: se construye SIN publicar (OPS-6605)."
+            fi
+          fi
           # Prefijo: el input, o la rama saneada ([A-Za-z0-9._-]).
           PREFIX="${PREFIX_IN:-$(echo "$REF_NAME" | tr -c 'A-Za-z0-9._\n-' '-')}"
           if [[ "$REF" == refs/tags/* ]]; then
@@ -322,7 +348,7 @@ jobs:
             echo "tag_primary=${PRIMARY}"
             echo "cache_ref=${IMAGE}:buildcache"
             echo "build_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "push=${{ github.event_name != 'pull_request' }}"
+            echo "push=${PUSH}"
             echo "tags<<EOF"; echo "$TAGS"; echo "EOF"
           } >> "$GITHUB_OUTPUT"
           echo "::notice title=tags ${{ matrix.slot }}::$(echo "$TAGS" | tr '\n' ' ')"
@@ -405,7 +431,7 @@ jobs:
             if [ "${{ steps.meta.outputs.push }}" = "true" ]; then
               echo "::notice title=Imagen publicada::${{ matrix.image }} → $(echo '${{ steps.meta.outputs.tags }}' | sed 's|.*:||' | tr '\n' ' ') (digest ${{ steps.build.outputs.digest }})"
             else
-              echo "::notice title=Compile gate OK::${{ matrix.slot }} construye. No se publica en PR."
+              echo "::notice title=Compile gate OK::${{ matrix.slot }} construye. No se publica: solo se publica desde la rama principal o un tag."
             fi
           elif [ "$OUTCOME" = "failure" ]; then
             echo "::error title=delivery-canon/build ${{ matrix.slot }}::el build de ${{ matrix.image }} FALLÓ. Mira el paso 'Build' de este job: es el Dockerfile o el código, no la receta."
