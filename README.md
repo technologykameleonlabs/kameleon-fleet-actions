@@ -101,6 +101,7 @@ jobs:
 Lo que garantiza, medido en squadwise-platform (OPS-4024):
 - **PR**: construye solo lo que la PR toca (compile gate, sin publicar).
 - **Rama principal / dispatch / tag**: reconstruye **todo, siempre** — acotar por diff en la principal pierde despliegues en silencio.
+- **Publica SOLO desde `refs/heads/<default_branch>` o un tag**. Un `workflow_dispatch` o un push sobre cualquier otra rama construye todo pero **no publica** y lo anuncia con `::notice` (OPS-6605: un dispatch sobre una rama de PR publicó `dev-latest` y el ImageUpdater desplegó en dev código que no estaba en main).
 - **Builds en paralelo**, sin esperar a checks de calidad (el gate fue la PR).
 - `arc-runner-small` + buildkitd del clúster + caché en registro: no ocupa el carril grande.
 - Cada fallo deja `::error` con taxonomía (`config` / `buildkit` / `build <slot>`).
