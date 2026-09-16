@@ -85,7 +85,14 @@ on:
 jobs:
   build-and-push:
     name: Build & push image (canon)
-    runs-on: arc-runner-small
+    # OPS-7100 (16-sep-2026, rediseño 5->2 carriles): arc-runner-small -> ci.
+    # Sin services: ni docker local aqui (el build delega en buildkitd
+    # remoto, igual que antes) -- no es de los que necesitan dind. NO
+    # fusionar hasta que infra-k8s#608 (ci/main) este mergeada Y el
+    # AutoscalingListener de `ci` este Running: apuntar aqui a un carril
+    # sin consumer real deja este build en cola infinita (mismo canon que
+    # OPS-3243 aplico a arc-runner-pr-small).
+    runs-on: ci
     permissions:
       contents: read
       packages: write
