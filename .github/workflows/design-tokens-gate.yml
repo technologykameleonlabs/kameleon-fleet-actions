@@ -117,7 +117,17 @@ jobs:
             exit 1
           fi
           echo "tailwindcss no esta instalado; instalo SOLO ese paquete, en el rango que declara el repo: $rango"
-          npm install --no-save --no-audit --no-fund --silent "tailwindcss@$rango"
+          # SIN `--silent`: la primera version lo llevaba y npm fallo en 2 segundos sin
+          # decir por que. El silencio en el paso que prepara una guarda cuesta una
+          # vuelta entera de CI.
+          #
+          # `CORE_PACKAGES_TOKEN` vacio a proposito: el `.npmrc` de estos repos declara
+          # `//npm.pkg.github.com/:_authToken=${CORE_PACKAGES_TOKEN}` para el scope
+          # privado, y npm ABORTA si esa variable no existe, aunque el paquete que
+          # instalamos sea publico y no toque ese registro. Darle un valor inerte deja
+          # que la sustitucion ocurra sin conceder acceso a nada.
+          CORE_PACKAGES_TOKEN="${CORE_PACKAGES_TOKEN:-sin-usar}" \
+            npm install --no-save --no-audit --no-fund "tailwindcss@$rango"
           test -e node_modules/tailwindcss/colors.js
 
       - name: check-token-colors
