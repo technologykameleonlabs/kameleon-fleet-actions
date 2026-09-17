@@ -75,9 +75,25 @@ jobs:
           BASE: ${{ github.event.pull_request.base.ref }}
         run: |
           set -euo pipefail
-          git fetch --no-tags --depth=1 origin "+refs/heads/$BASE:refs/remotes/origin/$BASE"
-          git rev-parse --verify "origin/$BASE" >/dev/null
-          echo "base disponible: origin/$BASE"
+          # No basta con TENER la base: el guard hace `git merge-base`, y dos clones
+          # superficiales de profundidad 1 no comparten ningun commit, asi que no hay
+          # ancestro comun que encontrar. Medido: el paso decia «base disponible» y el
+          # guard seguia muriendo con «no pude resolver la base». Hay que ahondar los dos
+          # lados hasta que exista ancestro, y decirlo en voz alta si no aparece.
+          git fetch --no-tags --depth=200 origin "+refs/heads/$BASE:refs/remotes/origin/$BASE"
+          git fetch --no-tags --deepen=200 || true
+
+          if ! git merge-base "origin/$BASE" HEAD >/dev/null 2>&1; then
+            echo "200 commits no alcanzan para el ancestro comun; traigo la historia entera"
+            git fetch --no-tags --unshallow origin "+refs/heads/$BASE:refs/remotes/origin/$BASE" || true
+            git fetch --no-tags --unshallow || true
+          fi
+
+          if ! git merge-base "origin/$BASE" HEAD >/dev/null 2>&1; then
+            echo "::error::No hay ancestro comun entre HEAD y origin/$BASE ni con la historia completa. La regla del componente nuevo no puede ejecutarse y el gate se declara ROJO aqui, con la causa a la vista, en vez de morir dentro del guard despues de auditar todo lo demas."
+            exit 1
+          fi
+          echo "base y ancestro comun disponibles: origin/$BASE ($(git merge-base "origin/$BASE" HEAD))"
 
       - name: El guard tiene que EXISTIR (un gate que aprueba por AUSENCIA es el fallo que corregimos)
         # Criterio de aceptación literal de OPS-4393: si un repo consumidor
