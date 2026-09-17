@@ -77,6 +77,49 @@ jobs:
           fi
           echo "guard encontrado: $GUARD"
 
+      - name: El guard necesita `tailwindcss` resoluble (deriva de él las familias de color)
+        # POR QUE ESTE PASO EXISTE (17-sep-2026): el guard dejo de usar solo
+        # `node:fs`/`git` cuando se amplio para derivar las familias de color del
+        # paquete `tailwindcss` instalado en vez de una lista tecleada a mano. Esa
+        # decision es correcta —una lista se queda corta con el siguiente color—
+        # pero convirtio al gate en dependiente de un `node_modules` que esta
+        # receta no monta a proposito. Resultado medido: el gate llevaba en ROJO
+        # en TODOS los repos desde la ampliacion, muriendo con «tailwindcss no
+        # esta instalado» ANTES de auditar un solo fichero. Una guarda que no
+        # llega a mirar nada no protege nada, y ademas bloqueaba a todo el mundo.
+        #
+        # Se instala UN paquete publico, no el arbol: sigue sin haber
+        # `pnpm install --frozen-lockfile` ni modo de fallo de lockfile, y el
+        # rango de version sale del propio repo, no escrito aqui. Si ya esta
+        # instalado (cache, imagen prehorneada), no se toca nada.
+        shell: bash
+        run: |
+          set -euo pipefail
+          encontrado=""
+          while read -r f; do
+            d=$(dirname "$f")
+            if [ -e "$d/node_modules/tailwindcss/colors.js" ]; then encontrado="$d"; break; fi
+          done < <(git ls-files -- '*/package.json' 'package.json')
+
+          if [ -n "$encontrado" ]; then
+            echo "tailwindcss ya resoluble en $encontrado/node_modules; no instalo nada"
+            exit 0
+          fi
+
+          # `grep` sin coincidencias sale 1 y arrastra a `xargs` a un 123 opaco bajo
+          # `pipefail`: sin el `|| true` el caso "no lo declara" moriria con un codigo
+          # sin mensaje en vez de con el error explicito de abajo.
+          rango=$( { git ls-files -- '*/package.json' 'package.json' \
+            | xargs -r grep -ho '"tailwindcss": *"[^"]*"' || true; } \
+            | head -1 | sed 's/.*: *"//; s/"$//')
+          if [ -z "$rango" ]; then
+            echo "::error::Este repo no declara tailwindcss en ningun package.json, pero su guard deriva de el las familias de color. El gate se declara ROJO en vez de aprobar sin mirar."
+            exit 1
+          fi
+          echo "tailwindcss no esta instalado; instalo SOLO ese paquete, en el rango que declara el repo: $rango"
+          npm install --no-save --no-audit --no-fund --silent "tailwindcss@$rango"
+          test -e node_modules/tailwindcss/colors.js
+
       - name: check-token-colors
         # Sin `continue-on-error`, sin `|| true` y sin tubería: el exit code del
         # guard ES el veredicto del gate y tiene que llegar intacto al job. Una
