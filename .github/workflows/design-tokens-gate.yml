@@ -117,17 +117,22 @@ jobs:
             exit 1
           fi
           echo "tailwindcss no esta instalado; instalo SOLO ese paquete, en el rango que declara el repo: $rango"
-          # SIN `--silent`: la primera version lo llevaba y npm fallo en 2 segundos sin
-          # decir por que. El silencio en el paso que prepara una guarda cuesta una
-          # vuelta entera de CI.
-          #
-          # `CORE_PACKAGES_TOKEN` vacio a proposito: el `.npmrc` de estos repos declara
-          # `//npm.pkg.github.com/:_authToken=${CORE_PACKAGES_TOKEN}` para el scope
-          # privado, y npm ABORTA si esa variable no existe, aunque el paquete que
-          # instalamos sea publico y no toque ese registro. Darle un valor inerte deja
-          # que la sustitucion ocurra sin conceder acceso a nada.
-          CORE_PACKAGES_TOKEN="${CORE_PACKAGES_TOKEN:-sin-usar}" \
-            npm install --no-save --no-audit --no-fund "tailwindcss@$rango"
+
+          # Se instala FUERA del repo y se enlaza. Dos razones, las dos medidas:
+          #  · estos monorepos son de pnpm y sus package.json usan `workspace:*`, un
+          #    protocolo que npm no entiende: instalar en la raiz muere con
+          #    EUNSUPPORTEDPROTOCOL sin haber intentado siquiera bajar el paquete;
+          #  · asi no se toca el arbol que el guard va a auditar.
+          # `CORE_PACKAGES_TOKEN` inerte: el `.npmrc` declara el token del scope privado
+          # por variable y npm aborta si no existe, aunque el paquete sea publico.
+          tmp="${RUNNER_TEMP:-/tmp}/tw-gate"
+          mkdir -p "$tmp"
+          printf '{"name":"tw-gate","private":true}\n' > "$tmp/package.json"
+          ( cd "$tmp" && CORE_PACKAGES_TOKEN="${CORE_PACKAGES_TOKEN:-sin-usar}" \
+              npm install --no-save --no-audit --no-fund "tailwindcss@$rango" )
+
+          mkdir -p node_modules
+          ln -sfn "$tmp/node_modules/tailwindcss" node_modules/tailwindcss
           test -e node_modules/tailwindcss/colors.js
 
       - name: check-token-colors
