@@ -153,6 +153,11 @@ on:
         type: string
         required: false
         default: "ci"
+      cache_mode:
+        description: "Modo de exportacion de cache de buildx: `min` (solo la imagen final, por defecto) o `max` (todas las capas intermedias). Medido el 17-sep: `max` costaba 185 s por build, tanto como compilar."
+        required: false
+        type: string
+        default: "min"
       buildkitd_endpoint:
         description: "buildkitd del clúster."
         required: false
@@ -400,7 +405,25 @@ jobs:
           # (familia MVP: instala @technologykameleonlabs/* desde GitHub Packages).
           secrets: ${{ inputs.mount_core_token && format('core_token={0}', secrets.CORE_PACKAGES_TOKEN) || '' }}
           cache-from: type=registry,ref=${{ steps.meta.outputs.cache_ref }}
-          cache-to: type=registry,ref=${{ steps.meta.outputs.cache_ref }},mode=max,ignore-error=true
+          # MEDIDO el 17-sep-2026 en un build real de `kameleonapp-lab` (run 35284285037, job
+          # 504 s de punta a punta):
+          #
+          #   #29 `pnpm --filter @kameleon/web build` (Next.js) .......... 186,4 s  (37 %)
+          #   #46 `exporting cache to registry` (mode=max) ............... 185,2 s  (37 %)
+          #   todo lo demas (setup, capas, prisma, push del manifiesto) ... ~132 s  (26 %)
+          #
+          # O sea: **exportar la cache costaba tanto como compilar el producto**. Con `mode=max`
+          # se suben TODAS las capas intermedias de los tres stages —unas 40, una a una, a GHCR—
+          # y ese trabajo va DESPUES del build y ANTES de que la imagen quede disponible, asi que
+          # se paga entero en la latencia de cada despliegue. La cadena que Julio quiere corta
+          # (mezcla -> pod) son ~11 min y esto es casi la quinta parte.
+          #
+          # `min` exporta solo las capas de la imagen final. Se pierde cache de los stages
+          # intermedios, asi que un build que cambie dependencias puede tardar algo mas: el
+          # intercambio esta medido en un sentido (185 s que se dejan de pagar SIEMPRE) y
+          # estimado en el otro (decenas de segundos, solo cuando cambian las dependencias).
+          # Es input para que un producto que prefiera lo contrario lo diga, sin tocar la receta.
+          cache-to: type=registry,ref=${{ steps.meta.outputs.cache_ref }},mode=${{ inputs.cache_mode }},ignore-error=true
           build-args: |
             GIT_SHA=${{ github.sha }}
             GIT_BRANCH=${{ github.ref_name }}
