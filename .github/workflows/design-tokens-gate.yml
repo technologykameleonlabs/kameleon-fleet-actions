@@ -62,6 +62,23 @@ jobs:
         with:
           node-version: ${{ inputs.node_version }}
 
+      - name: Traer la rama base (la regla del componente nuevo la necesita)
+        # El checkout es `fetch-depth: 1` por coste, asi que en una PR el repo no tiene
+        # `origin/<base>` y la regla (iii) del guard —fichero NUEVO en components/ui/ que
+        # no referencia ninguna pieza `kl-*`— no puede saber que es "nuevo".
+        #
+        # Medido: el guard no la omitia, moria con «no pude resolver la base "origin/dev"»
+        # y tumbaba el gate entero DESPUES de haber auditado bien todo lo demas. Se le da
+        # la base, tambien superficial: un fetch de una rama, no la historia.
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "+refs/heads/$BASE:refs/remotes/origin/$BASE"
+          git rev-parse --verify "origin/$BASE" >/dev/null
+          echo "base disponible: origin/$BASE"
+
       - name: El guard tiene que EXISTIR (un gate que aprueba por AUSENCIA es el fallo que corregimos)
         # Criterio de aceptación literal de OPS-4393: si un repo consumidor
         # invoca este workflow sin tener el script, el gate debe ponerse ROJO
